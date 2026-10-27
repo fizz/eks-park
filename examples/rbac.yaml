@@ -1,0 +1,40 @@
+# What eks-park does inside the cluster. Bind it to the IAM role that runs
+# eks-park through an EKS access entry, with the group name below.
+#
+#   aws eks create-access-entry --cluster-name C --principal-arn ROLE \
+#     --kubernetes-groups eks-park
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: eks-park
+rules:
+  # Reachability, node readiness, pods to check images and the unpark result.
+  - nonResourceURLs: ["/readyz"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
+  # Finding the cluster-autoscaler, and scaling it to 0 and back on a full park.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "patch", "update"]
+  # Suspending CronJobs that would have nowhere to run, and resuming them.
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["get", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: eks-park
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: eks-park
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: eks-park

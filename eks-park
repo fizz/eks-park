@@ -1,0 +1,816 @@
+#!/usr/bin/env bash
+# eks-park — switch an EKS cluster's compute off for a while, and back on.
+#
+#   eks-park status <cluster> [options]
+#   eks-park park   <cluster> [options]
+#   eks-park unpark <cluster> [options]
+#
+# Park records what it changes in one SSM parameter, so unpark takes no sizes
+# and the person who unparks does not need to be the person who parked.
+#
+# What park does, in order:
+#   1. Records each selected nodegroup's scaling config, merging onto an
+#      existing record, so parking a parked cluster changes nothing.
+#   2. Stops the cluster-autoscaler from bringing the capacity back.
+#   3. Suspends CronJobs that would have nowhere to run.
+#   4. Sets the selected nodegroups to 0 and terminates their instances.
+#   5. Waits until the selection has no instances.
+#   6. With --delete-lbs: for each of the cluster's load balancers with no
+#      healthy targets, points its DNS records at the parked page, waits for
+#      Route53 to apply the change, then deletes the load balancer.
+#
+# unpark reverses it, and points any record still on the parked page at the
+# load balancer the controller rebuilds. It then waits for pods to start, and
+# exits 1 only for pods that cannot start however long they wait.
+
+set -euo pipefail
+
+# 4.4 for empty arrays under set -u, mapfile and ${var,,}. macOS ships 3.2.
+if [ "${BASH_VERSINFO[0]}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" = 4 ] && [ "${BASH_VERSINFO[1]}" -lt 4 ]; }; then
+  echo "eks-park needs bash 4.4 or later (this is $BASH_VERSION)" >&2; exit 2
+fi
+
+VERSION=1.0.0
+
+usage() {
+  cat <<'EOF'
+usage: eks-park <status|park|unpark> <cluster> [options]
+
+  --region R              AWS region (default: $AWS_REGION)
+  --context C             kubectl context (default: the cluster name)
+  --state-param P         SSM parameter for the record (default: /eks-park/<cluster>)
+  --only a,b              park only these nodegroups
+  --except a,b            park every nodegroup but these
+  --delete-lbs            park: delete load balancers with no healthy targets,
+                          after their DNS records point at a parked page
+  --parked-page D         CloudFront domain to point records at. Default: look up
+                          the distribution whose comment is "Parked page for <zone>"
+  --zone Z                only look for records in this hosted zone (repeatable)
+  --allow-dangling        delete a load balancer even when one of its records has
+                          no parked page to go to
+  --skip-image-check      park: do not check that images can still be pulled
+  --timeout SECONDS       how long to wait for instances, nodes and load
+                          balancers (default: 600)
+  --pod-settle SECONDS    unpark: how long pods get to start before the check
+                          (default: 300)
+  --dry-run               print what would change, change nothing
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------------
+
+ACTION="${1:-}"; CLUSTER="${2:-}"
+case "$ACTION" in
+  status|park|unpark) ;;
+  -h|--help|help) usage; exit 0 ;;
+  --version) echo "eks-park $VERSION"; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+[ -n "$CLUSTER" ] || { usage >&2; exit 2; }
+shift 2
+
+REGION="${AWS_REGION:-}"; CONTEXT=""; STATE_PARAM=""
+ONLY=""; EXCEPT=""; DELETE_LBS=0; PARKED_PAGE=""; ZONES=(); ALLOW_DANGLING=0
+CHECK_IMAGES=1; TIMEOUT=600; DRY=0; POD_SETTLE_ARG=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --region)           REGION="${2:?--region needs a value}"; shift 2 ;;
+    --context)          CONTEXT="${2:?--context needs a value}"; shift 2 ;;
+    --state-param)      STATE_PARAM="${2:?--state-param needs a value}"; shift 2 ;;
+    --only)             ONLY="${2:?--only needs a list}"; shift 2 ;;
+    --except)           EXCEPT="${2:?--except needs a list}"; shift 2 ;;
+    --delete-lbs)       DELETE_LBS=1; shift ;;
+    --parked-page)      PARKED_PAGE="${2:?--parked-page needs a domain}"; shift 2 ;;
+    --zone)             ZONES+=("${2:?--zone needs a name}"); shift 2 ;;
+    --allow-dangling)   ALLOW_DANGLING=1; shift ;;
+    --skip-image-check) CHECK_IMAGES=0; shift ;;
+    --timeout)          TIMEOUT="${2:?--timeout needs seconds}"; shift 2 ;;
+    --pod-settle)       POD_SETTLE_ARG="${2:?--pod-settle needs seconds}"; shift 2 ;;
+    --dry-run)          DRY=1; shift ;;
+    *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[ -n "$REGION" ] || { echo "--region or AWS_REGION is required" >&2; exit 2; }
+[ -n "$ONLY" ] && [ -n "$EXCEPT" ] && { echo "--only and --except cannot be combined" >&2; exit 2; }
+CONTEXT="${CONTEXT:-$CLUSTER}"
+STATE_PARAM="${STATE_PARAM:-/eks-park/$CLUSTER}"
+
+for tool in aws jq kubectl; do
+  command -v "$tool" >/dev/null || { echo "$tool is required" >&2; exit 2; }
+done
+
+# CloudFront's alias target zone. It is the same in every account.
+CLOUDFRONT_ZONE=Z2FDTNDATAQYW2
+CA_TAG="k8s.io/cluster-autoscaler/enabled"
+
+log()  { echo "$(date -u '+%H:%M:%SZ') | $*"; }
+warn() { echo "$(date -u '+%H:%M:%SZ') | WARNING: $*" >&2; }
+die()  { echo "$(date -u '+%H:%M:%SZ') | ERROR: $*" >&2; exit 1; }
+
+# Every AWS call names the region. A call without it goes wherever the profile
+# points, and in a GovCloud partition that is the wrong endpoint.
+awsr() { aws --region "$REGION" "$@"; }
+kc()   { kubectl --context "$CONTEXT" "$@"; }
+
+# A change. In a dry run it is printed instead.
+run() {
+  if [ "$DRY" = 1 ]; then log "DRY: $*"; else "$@"; fi
+}
+
+# ---------------------------------------------------------------------------
+# The record
+# ---------------------------------------------------------------------------
+
+read_state() {
+  local v
+  if v=$(awsr ssm get-parameter --name "$STATE_PARAM" \
+           --query Parameter.Value --output text 2>/dev/null); then
+    jq -c . <<<"$v"
+  else
+    echo '{}'
+  fi
+}
+
+write_state() {   # $1 = JSON
+  if [ "$DRY" = 1 ]; then
+    log "DRY: write $STATE_PARAM: $(jq -c . <<<"$1")"
+    return 0
+  fi
+  # Intelligent-Tiering moves the parameter to the advanced tier only when the
+  # record grows past the standard tier's 4 KB, which many DNS records can do.
+  awsr ssm put-parameter --name "$STATE_PARAM" --type String --overwrite \
+    --tier Intelligent-Tiering --value "$1" >/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Nodegroups
+# ---------------------------------------------------------------------------
+
+all_nodegroups() {
+  awsr eks list-nodegroups --cluster-name "$CLUSTER" \
+    --query 'nodegroups[]' --output text | tr '\t' '\n' | sed '/^$/d'
+}
+
+selected_nodegroups() {
+  local ng
+  for ng in $(all_nodegroups); do
+    if [ -n "$ONLY" ]; then
+      [[ ",$ONLY," == *",$ng,"* ]] && echo "$ng"
+    elif [ -n "$EXCEPT" ]; then
+      [[ ",$EXCEPT," == *",$ng,"* ]] || echo "$ng"
+    else
+      echo "$ng"
+    fi
+  done
+}
+
+is_full_park() { [ -z "$ONLY" ] && [ -z "$EXCEPT" ]; }
+
+scaling_config() {   # $1 = nodegroup -> {"minSize":..,"maxSize":..,"desiredSize":..}
+  awsr eks describe-nodegroup --cluster-name "$CLUSTER" --nodegroup-name "$1" \
+    --query 'nodegroup.scalingConfig' --output json | jq -c .
+}
+
+nodegroup_asgs() {   # $1 = nodegroup
+  awsr eks describe-nodegroup --cluster-name "$CLUSTER" --nodegroup-name "$1" \
+    --query 'nodegroup.resources.autoScalingGroups[].name' --output text \
+    | tr '\t' '\n' | sed '/^$/d'
+}
+
+asg_instances() {   # ASG names as arguments -> instance ids
+  [ $# -gt 0 ] || return 0
+  awsr autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$@" \
+    --query 'AutoScalingGroups[].Instances[].InstanceId' --output text \
+    | tr '\t' '\n' | sed '/^$/d'
+}
+
+asg_has_ca_tag() {   # $1 = ASG
+  [ "$(awsr autoscaling describe-tags \
+        --filters "Name=auto-scaling-group,Values=$1" "Name=key,Values=$CA_TAG" \
+        --query 'length(Tags)' --output text)" != 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# Cluster-autoscaler
+#
+# A full park scales it to 0. A partial park cannot: the nodegroups that stay up
+# still need it. It would also bring a parked nodegroup back within a couple of
+# minutes, because min and desired of 0 do not bind it and EKS rejects a max of 0.
+# So a partial park removes the auto-discovery tag from the parked nodegroups'
+# ASGs instead, and unpark puts it back. That works for auto-discovery only. A
+# cluster-autoscaler given explicit --nodes flags is not affected by the tag.
+# ---------------------------------------------------------------------------
+
+find_autoscaler() {   # -> "namespace name replicas", or nothing
+  kc get deploy -A -o json 2>/dev/null | jq -r '
+    .items[]
+    | select((.metadata.name | test("cluster-autoscaler"))
+             or (.metadata.labels["app.kubernetes.io/name"] // "" | test("cluster-autoscaler")))
+    | "\(.metadata.namespace) \(.metadata.name) \(.spec.replicas // 1)"' | head -1
+}
+
+# ---------------------------------------------------------------------------
+# CronJobs
+#
+# A Deployment's pods wait as Pending and start when nodes return. A CronJob
+# creates a new Job every time it fires, and over a weekend those pile up and
+# all start at once on unpark. Park suspends the CronJobs that have no node to
+# run on, and unpark resumes exactly those.
+#
+# On a partial park a CronJob can still run if its nodeSelector matches a node
+# that stays up. Required node affinity and taints are not evaluated. A CronJob
+# that relies on them is suspended on a partial park when it could have run.
+# ---------------------------------------------------------------------------
+
+surviving_node_labels() {   # $1 = comma list of parked nodegroups -> JSON array of label maps
+  kc get nodes -o json | PARKED="$1" jq -c '
+    (env.PARKED | split(",")) as $parked
+    | [.items[].metadata.labels
+       | select((.["eks.amazonaws.com/nodegroup"] // "") as $ng | ($parked | index($ng)) | not)]'
+}
+
+cronjobs_to_suspend() {   # $1 = surviving label maps -> ns/name lines
+  kc get cronjobs -A -o json | SURVIVING="$1" jq -r '
+    (env.SURVIVING | fromjson) as $nodes
+    | .items[]
+    | select(.spec.suspend != true)
+    | (.spec.jobTemplate.spec.template.spec.nodeSelector // {}) as $sel
+    | select([$nodes[] | . as $l | ($sel | to_entries | all(.value == $l[.key]))] | any | not)
+    | "\(.metadata.namespace)/\(.metadata.name)"'
+}
+
+# ---------------------------------------------------------------------------
+# Images
+#
+# A node pulls its images again when it comes back. An image deleted from a
+# public registry since it was last pulled cannot be pulled, and that pod does
+# not start after unpark. Park checks every image not in ECR before it changes
+# anything, and refuses when the registry says an image no longer exists. Any
+# other failure (rate limit, network) is a warning, with the registry's message.
+# ---------------------------------------------------------------------------
+
+check_images() {   # $1 = comma list of parked nodegroups
+  if ! command -v crane >/dev/null; then
+    warn "crane is not installed; images not checked"
+    return 0
+  fi
+  local nodes images img out missing=0
+  nodes=$(kc get nodes -o json | PARKED="$1" jq -r '
+    (env.PARKED | split(",")) as $p
+    | .items[] | select((.metadata.labels["eks.amazonaws.com/nodegroup"] // "") as $ng | $p | index($ng))
+    | .metadata.name')
+  [ -n "$nodes" ] || { log "images: no running nodes in the selection"; return 0; }
+  images=$(kc get pods -A -o json | NODES="$nodes" jq -r '
+    (env.NODES | split("\n")) as $n
+    | .items[] | select(.spec.nodeName as $x | $n | index($x))
+    | (.spec.containers + (.spec.initContainers // []))[].image' \
+    | { grep -v -E '\.dkr\.ecr\.[^/]+\.amazonaws\.com/' || true; } | sort -u)
+  log "images: checking $(echo "$images" | sed '/^$/d' | wc -l | tr -d ' ') outside ECR"
+  for img in $images; do
+    if out=$(crane digest "$img" 2>&1); then
+      continue
+    fi
+    if grep -q -i -E 'MANIFEST_UNKNOWN|NAME_UNKNOWN|not found' <<<"$out"; then
+      warn "image gone: $img ($(tail -1 <<<"$out"))"
+      missing=$((missing + 1))
+    else
+      warn "image not verified: $img ($(tail -1 <<<"$out"))"
+    fi
+  done
+  [ "$missing" = 0 ] || die "$missing image(s) can no longer be pulled. Fix or pin them, or pass --skip-image-check."
+}
+
+# ---------------------------------------------------------------------------
+# Load balancers and DNS
+# ---------------------------------------------------------------------------
+
+# The load balancers the cluster created. The AWS Load Balancer Controller tags
+# its own with elbv2.k8s.aws/cluster. The in-tree service controller tags its own
+# with kubernetes.io/cluster/<cluster>.
+cluster_lb_arns() {
+  {
+    awsr resourcegroupstaggingapi get-resources \
+      --tag-filters "Key=elbv2.k8s.aws/cluster,Values=$CLUSTER" \
+      --resource-type-filters elasticloadbalancing:loadbalancer \
+      --query 'ResourceTagMappingList[].ResourceARN' --output text
+    awsr resourcegroupstaggingapi get-resources \
+      --tag-filters "Key=kubernetes.io/cluster/$CLUSTER" \
+      --resource-type-filters elasticloadbalancing:loadbalancer \
+      --query 'ResourceTagMappingList[].ResourceARN' --output text
+  } | tr '\t' '\n' | sed '/^$/d' | sort -u
+}
+
+lb_is_controller_owned() {   # $1 = arn
+  [ "$(awsr resourcegroupstaggingapi get-resources --resource-arn-list "$1" \
+        --query "length(ResourceTagMappingList[0].Tags[?Key=='elbv2.k8s.aws/cluster'])" \
+        --output text)" != 0 ]
+}
+
+# "name dnsName canonicalZone" for an elbv2 ARN, or nothing when it no longer
+# exists. The tagging API can list a load balancer for a while after deletion.
+lb_describe() {   # $1 = arn
+  if [[ "$1" == *":loadbalancer/app/"* || "$1" == *":loadbalancer/net/"* || "$1" == *":loadbalancer/gwy/"* ]]; then
+    awsr elbv2 describe-load-balancers --load-balancer-arns "$1" \
+      --query 'LoadBalancers[0].[LoadBalancerName,DNSName,CanonicalHostedZoneId]' \
+      --output text 2>/dev/null || true
+  else
+    awsr elb describe-load-balancers --load-balancer-names "${1##*/}" \
+      --query 'LoadBalancerDescriptions[0].[LoadBalancerName,DNSName,CanonicalHostedZoneNameID]' \
+      --output text 2>/dev/null || true
+  fi
+}
+
+lb_healthy_targets() {   # $1 = arn
+  local total=0 tg n
+  if [[ "$1" != *":loadbalancer/app/"* && "$1" != *":loadbalancer/net/"* ]]; then
+    awsr elb describe-instance-health --load-balancer-name "${1##*/}" \
+      --query "length(InstanceStates[?State=='InService'])" --output text
+    return
+  fi
+  for tg in $(awsr elbv2 describe-target-groups --load-balancer-arn "$1" \
+                --query 'TargetGroups[].TargetGroupArn' --output text); do
+    n=$(awsr elbv2 describe-target-health --target-group-arn "$tg" \
+          --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" --output text)
+    total=$((total + ${n:-0}))
+  done
+  echo "$total"
+}
+
+# Hosted zones to search: the ones named with --zone, or every zone the
+# account has. Prints "id name" with the trailing dot dropped from the name.
+hosted_zones() {
+  local all
+  all=$(awsr route53 list-hosted-zones --output json \
+        | jq -r '.HostedZones[] | "\(.Id | sub("/hostedzone/"; "")) \(.Name | rtrimstr("."))"')
+  if [ ${#ZONES[@]} = 0 ]; then
+    echo "$all"
+  else
+    local z
+    for z in "${ZONES[@]}"; do grep -E " ${z%.}$" <<<"$all" || warn "no hosted zone named $z"; done
+  fi
+}
+
+# Records aimed at a DNS name, as JSON lines {zoneId, zone, name, type}. Alias
+# records match on the alias target, CNAMEs on their value. Both are compared
+# without case, without the trailing dot and without the dualstack. prefix.
+records_for() {   # $1 = load balancer DNS name, $2 = hosted_zones output
+  local id zone
+  while read -r id zone; do
+    [ -n "$id" ] || continue
+    awsr route53 list-resource-record-sets --hosted-zone-id "$id" --output json \
+      | TARGET="$1" ZID="$id" ZONE="$zone" jq -c '
+          def norm: ascii_downcase | rtrimstr(".") | ltrimstr("dualstack.");
+          (env.TARGET | norm) as $t
+          | .ResourceRecordSets[]
+          | select(
+              ((.AliasTarget.DNSName // "") | norm) == $t
+              or (.Type == "CNAME" and ((.ResourceRecords // [])[0].Value // "" | norm) == $t))
+          | {zoneId: env.ZID, zone: env.ZONE, name: (.Name | gsub("\\\\052"; "*")), type: .Type}'
+  done <<<"$2"
+}
+
+# The parked page for a hosted zone: --parked-page when given, otherwise the
+# distribution whose comment is "Parked page for <zone>". Prints the CloudFront
+# domain, or nothing.
+DISTRIBUTIONS='[]'
+load_distributions() {
+  [ -z "$PARKED_PAGE" ] || return 0
+  # CloudFront is global. A partition without it (GovCloud) has no parked page
+  # to find, and --parked-page names one in the commercial partition instead.
+  DISTRIBUTIONS=$(aws cloudfront list-distributions --output json 2>/dev/null \
+    | jq -c '[.DistributionList.Items // [] | .[] | {comment: .Comment, domain: .DomainName}]' \
+    || echo '[]')
+}
+
+parked_page_for() {   # $1 = zone name
+  if [ -n "$PARKED_PAGE" ]; then echo "$PARKED_PAGE"; return; fi
+  ZONE="$1" jq -r '.[] | select(.comment == "Parked page for \(env.ZONE)") | .domain' \
+    <<<"$DISTRIBUTIONS" | head -1
+}
+
+# UPSERT one record to an alias or CNAME target and wait until Route53 applies it.
+point_record() {   # $1 = record JSON, $2 = target DNS name, $3 = target alias zone, $4 = evaluate health
+  local zid name type change id
+  zid=$(jq -r .zoneId <<<"$1"); name=$(jq -r .name <<<"$1"); type=$(jq -r .type <<<"$1")
+  if [ "$type" = CNAME ]; then
+    change=$(jq -nc --arg n "$name" --arg v "$2" \
+      '{Changes:[{Action:"UPSERT",ResourceRecordSet:{Name:$n,Type:"CNAME",TTL:60,ResourceRecords:[{Value:$v}]}}]}')
+  else
+    change=$(jq -nc --arg n "$name" --arg t "$type" --arg d "$2" --arg z "$3" --argjson e "$4" \
+      '{Changes:[{Action:"UPSERT",ResourceRecordSet:{Name:$n,Type:$t,AliasTarget:{HostedZoneId:$z,DNSName:$d,EvaluateTargetHealth:$e}}}]}')
+  fi
+  if [ "$DRY" = 1 ]; then log "DRY: $type $name -> $2"; return 0; fi
+  id=$(awsr route53 change-resource-record-sets --hosted-zone-id "$zid" \
+        --change-batch "$change" --query ChangeInfo.Id --output text) || return 1
+  wait_insync "$id" || return 1
+  log "  $type $name -> $2"
+}
+
+wait_insync() {   # $1 = change id
+  local deadline=$((SECONDS + 300))
+  while [ "$(awsr route53 get-change --id "$1" --query ChangeInfo.Status --output text)" != INSYNC ]; do
+    [ $SECONDS -lt $deadline ] || { warn "Route53 change $1 not INSYNC after 5 minutes"; return 1; }
+    sleep 5
+  done
+}
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+
+status() {
+  local state ng cfg asgs n lbs arn d
+  state=$(read_state)
+  log "cluster $CLUSTER ($REGION), record $STATE_PARAM: $(jq -r 'if .parked == true then "PARKED since \(.parkedAt)" elif .parked == false then "unparked \(.unparkedAt // "")" else "none" end' <<<"$state")"
+  for ng in $(all_nodegroups); do
+    cfg=$(scaling_config "$ng")
+    mapfile -t asgs < <(nodegroup_asgs "$ng")
+    n=$(asg_instances "${asgs[@]}" | wc -l | tr -d ' ')
+    log "  $ng: min $(jq .minSize <<<"$cfg") max $(jq .maxSize <<<"$cfg") desired $(jq .desiredSize <<<"$cfg"), $n instance(s)$(jq -r --arg ng "$ng" 'if .nodegroups[$ng] then ", recorded desired \(.nodegroups[$ng].desiredSize)" else "" end' <<<"$state")"
+  done
+  lbs=$(cluster_lb_arns)
+  for arn in $lbs; do
+    d=$(lb_describe "$arn"); [ -n "$d" ] || continue
+    log "  load balancer $(cut -f1 <<<"$d"): $(lb_healthy_targets "$arn") healthy target(s)$(lb_is_controller_owned "$arn" || echo ', in-tree service')"
+  done
+  jq -r '.loadBalancers // [] | .[] | "  deleted at park: \(.name), \(.records | length) record(s)"' <<<"$state" \
+    | while read -r line; do log "$line"; done
+}
+
+# ---------------------------------------------------------------------------
+# park
+# ---------------------------------------------------------------------------
+
+park() {
+  local sel sel_csv state prior ng cfg asgs asg ca ns name replicas
+  sel=$(selected_nodegroups)
+  [ -n "$sel" ] || die "no nodegroup matches the selection"
+  sel_csv=$(paste -sd, - <<<"$sel")
+  log "PARK $CLUSTER ($REGION): $(tr '\n' ' ' <<<"$sel")"
+  is_full_park || log "partial park: the other nodegroups stay up"
+
+  # Reachability first. Everything below the nodegroups needs the API server.
+  kc get --raw /readyz >/dev/null 2>&1 || die "kubectl context $CONTEXT cannot reach the cluster"
+
+  [ "$CHECK_IMAGES" = 1 ] && check_images "$sel_csv"
+
+  # A record from a park that was undone describes nothing current. Only a
+  # record of a park still in effect is merged onto.
+  prior=$(read_state | jq -c 'if .parked == true then . else {} end')
+  state=$(jq -c --arg c "$CLUSTER" --arg v "$VERSION" --arg t "$(date -u +%FT%TZ)" '
+    {nodegroups: {}, cronjobs: [], loadBalancers: []} + .
+    | .parkedAt = (.parkedAt // $t) | .parked = true | .version = $v | .cluster = $c' <<<"$prior")
+
+  # 1. Scaling config. A nodegroup already at 0 keeps what an earlier park recorded.
+  for ng in $sel; do
+    cfg=$(scaling_config "$ng")
+    if [ "$(jq .desiredSize <<<"$cfg")" = 0 ] && [ "$(jq .minSize <<<"$cfg")" = 0 ] \
+       && [ "$(jq --arg ng "$ng" '.nodegroups[$ng] != null' <<<"$prior")" = true ]; then
+      log "  $ng is at 0 already; keeping the recorded config"
+      continue
+    fi
+    state=$(jq -c --arg ng "$ng" --argjson cfg "$cfg" '.nodegroups[$ng] = ($cfg + (.nodegroups[$ng].caTagAsgs // [] | {caTagAsgs: .}))' <<<"$state")
+  done
+
+  # 2. Cluster-autoscaler.
+  ca=$(find_autoscaler)
+  if [ -n "$ca" ]; then
+    read -r ns name replicas <<<"$ca"
+    if is_full_park; then
+      if [ "$replicas" != 0 ]; then
+        state=$(jq -c --arg ns "$ns" --arg n "$name" --argjson r "$replicas" \
+          '.autoscaler = {namespace: $ns, name: $n, replicas: $r}' <<<"$state")
+      fi
+    else
+      for ng in $sel; do
+        for asg in $(nodegroup_asgs "$ng"); do
+          asg_has_ca_tag "$asg" || continue
+          state=$(jq -c --arg ng "$ng" --arg a "$asg" \
+            '.nodegroups[$ng].caTagAsgs = ((.nodegroups[$ng].caTagAsgs // []) + [$a] | unique)' <<<"$state")
+        done
+      done
+    fi
+  fi
+
+  # 3. CronJobs.
+  local surviving cj
+  surviving=$(surviving_node_labels "$sel_csv")
+  for cj in $(cronjobs_to_suspend "$surviving"); do
+    state=$(jq -c --arg cj "$cj" '.cronjobs = (.cronjobs + [$cj] | unique)' <<<"$state")
+  done
+
+  # The record goes in before anything changes, so a park interrupted at any
+  # point below can be undone by unpark.
+  write_state "$state"
+  log "recorded to $STATE_PARAM"
+
+  if [ -n "$ca" ]; then
+    if is_full_park; then
+      log "scaling $ns/$name to 0"
+      run kc -n "$ns" scale deploy "$name" --replicas=0 >/dev/null
+    else
+      for asg in $(jq -r '.nodegroups[].caTagAsgs // [] | .[]' <<<"$state"); do
+        log "removing $CA_TAG from $asg"
+        run awsr autoscaling delete-tags --tags "ResourceId=$asg,ResourceType=auto-scaling-group,Key=$CA_TAG"
+      done
+    fi
+  fi
+
+  for cj in $(jq -r '.cronjobs[]' <<<"$state"); do
+    log "suspending cronjob $cj"
+    run kc -n "${cj%%/*}" patch cronjob "${cj##*/}" --type merge -p '{"spec":{"suspend":true}}' >/dev/null \
+      || warn "could not suspend $cj"
+  done
+
+  # 4. Nodegroups to 0, then terminate. Scaling to 0 alone drains, and a drain
+  # stops at the first pod with an emptyDir or a PodDisruptionBudget allowing 0.
+  local all_asgs=() ids
+  for ng in $sel; do
+    cfg=$(scaling_config "$ng")
+    log "nodegroup $ng -> min 0, desired 0 (max $(jq .maxSize <<<"$cfg"))"
+    run awsr eks update-nodegroup-config --cluster-name "$CLUSTER" --nodegroup-name "$ng" \
+      --scaling-config "minSize=0,maxSize=$(jq .maxSize <<<"$cfg"),desiredSize=0" >/dev/null
+    mapfile -t asgs < <(nodegroup_asgs "$ng")
+    all_asgs+=("${asgs[@]}")
+  done
+  ids=$(asg_instances "${all_asgs[@]}" | tr '\n' ' ')
+  if [ -n "${ids// /}" ]; then
+    log "terminating $ids"
+    # shellcheck disable=SC2086
+    run awsr ec2 terminate-instances --instance-ids $ids >/dev/null
+  fi
+
+  if [ "$DRY" = 1 ]; then
+    # With the nodes still up every target is healthy, so this shows which load
+    # balancers and records are in play rather than what a real park deletes.
+    [ "$DELETE_LBS" = 1 ] && park_lbs
+    log "DRY RUN: nothing changed"
+    return 0
+  fi
+
+  # 5. Wait for the instances to go.
+  local deadline=$((SECONDS + TIMEOUT)) left
+  while :; do
+    left=$(asg_instances "${all_asgs[@]}" | wc -l | tr -d ' ')
+    [ "$left" = 0 ] && break
+    [ $SECONDS -lt $deadline ] || die "$left instance(s) still in the selection after ${TIMEOUT}s. DNS and load balancers left as they are."
+    log "  instances left: $left"
+    sleep 15
+  done
+  log "PARKED: no instances in the selection"
+
+  # 6. Load balancers.
+  [ "$DELETE_LBS" = 1 ] && park_lbs
+  return 0
+}
+
+park_lbs() {
+  local zones arn d name dns healthy records rec zone page failed kept=0 removed=0
+  zones=$(hosted_zones)
+  load_distributions
+  for arn in $(cluster_lb_arns); do
+    d=$(lb_describe "$arn"); [ -n "$d" ] || continue
+    read -r name dns _ <<<"$d"
+
+    # Ask the load balancer, not the selection. A partial park can leave a
+    # nodegroup up behind a load balancer it shares with a parked one.
+    # The in-tree service controller runs in the control plane, which a park
+    # does not stop. It would recreate this load balancer at once.
+    if ! lb_is_controller_owned "$arn"; then
+      log "keeping $name: an in-tree Service owns it, and the control plane recreates it"
+      kept=$((kept + 1)); continue
+    fi
+    records=$(records_for "$dns" "$zones")
+    healthy=$(lb_healthy_targets "$arn")
+    if [ "$healthy" != 0 ]; then
+      log "keeping $name: $healthy healthy target(s), $(jq -sc length <<<"$records") record(s)"
+      kept=$((kept + 1)); continue
+    fi
+
+    failed=0
+    while read -r rec; do
+      [ -n "$rec" ] || continue
+      zone=$(jq -r .zone <<<"$rec")
+      page=$(parked_page_for "$zone")
+      if [ -z "$page" ]; then
+        warn "$(jq -r .name <<<"$rec") has no parked page in $zone"
+        failed=$((failed + 1)); continue
+      fi
+      point_record "$rec" "$page" "$CLOUDFRONT_ZONE" false || failed=$((failed + 1))
+    done <<<"$records"
+
+    if [ "$failed" != 0 ] && [ "$ALLOW_DANGLING" != 1 ]; then
+      warn "keeping $name: $failed record(s) would point at a deleted load balancer (--allow-dangling to delete anyway)"
+      kept=$((kept + 1)); continue
+    fi
+
+    # Recorded before the delete, so unpark can find the records again even if
+    # this run stops right after.
+    local state
+    state=$(read_state)
+    state=$(jq -c --arg n "$name" --arg d "$dns" --argjson r "$(jq -sc . <<<"$records")" '
+      .loadBalancers = ([.loadBalancers[] | select(.name != $n)] + [{name: $n, dnsName: $d, records: $r}])' <<<"$state")
+    write_state "$state"
+
+    log "deleting $name ($(jq -sc length <<<"$records") record(s) moved)"
+    run awsr elbv2 delete-load-balancer --load-balancer-arn "$arn"
+    removed=$((removed + 1))
+  done
+  log "load balancers: $removed deleted, $kept kept"
+}
+
+# ---------------------------------------------------------------------------
+# unpark
+# ---------------------------------------------------------------------------
+
+unpark() {
+  local state ng mn mx ds asg want ready deadline
+  state=$(read_state)
+  [ "$(jq -r '.parked // empty' <<<"$state")" = true ] || die "no park recorded at $STATE_PARAM"
+  log "UNPARK $CLUSTER ($REGION) from $STATE_PARAM"
+
+  for ng in $(jq -r '.nodegroups | keys[]' <<<"$state"); do
+    read -r mn mx ds < <(jq -r --arg ng "$ng" '.nodegroups[$ng] | "\(.minSize) \(.maxSize) \(.desiredSize)"' <<<"$state")
+    log "nodegroup $ng -> min $mn, max $mx, desired $ds"
+    run awsr eks update-nodegroup-config --cluster-name "$CLUSTER" --nodegroup-name "$ng" \
+      --scaling-config "minSize=$mn,maxSize=$mx,desiredSize=$ds" >/dev/null
+    for asg in $(jq -r --arg ng "$ng" '.nodegroups[$ng].caTagAsgs // [] | .[]' <<<"$state"); do
+      log "restoring $CA_TAG on $asg"
+      run awsr autoscaling create-or-update-tags \
+        --tags "ResourceId=$asg,ResourceType=auto-scaling-group,Key=$CA_TAG,Value=true,PropagateAtLaunch=true"
+    done
+  done
+
+  # A CronJob deleted while parked is not an error. It is no longer anyone's to resume.
+  local cj
+  for cj in $(jq -r '.cronjobs[]?' <<<"$state"); do
+    if kc -n "${cj%%/*}" get cronjob "${cj##*/}" >/dev/null 2>&1; then
+      log "resuming cronjob $cj"
+      run kc -n "${cj%%/*}" patch cronjob "${cj##*/}" --type merge -p '{"spec":{"suspend":false}}' >/dev/null \
+        || warn "could not resume $cj"
+    else
+      log "cronjob $cj no longer exists"
+    fi
+  done
+
+  if [ "$(jq '.autoscaler != null' <<<"$state")" = true ]; then
+    local ns name r
+    read -r ns name r < <(jq -r '.autoscaler | "\(.namespace) \(.name) \(.replicas)"' <<<"$state")
+    log "scaling $ns/$name to $r"
+    run kc -n "$ns" scale deploy "$name" --replicas="$r" >/dev/null || warn "could not scale $ns/$name"
+  fi
+
+  [ "$DRY" = 1 ] && { log "DRY RUN: nothing changed"; return 0; }
+
+  # Nodes. A nodegroup is Active before its nodes are Ready.
+  want=$(jq '[.nodegroups[].desiredSize] | add // 0' <<<"$state")
+  deadline=$((SECONDS + TIMEOUT))
+  while :; do
+    ready=$(kc get nodes -o json 2>/dev/null | NGS="$(jq -r '.nodegroups | keys | join(",")' <<<"$state")" jq '
+      (env.NGS | split(",")) as $ngs
+      | [.items[]
+         | select((.metadata.labels["eks.amazonaws.com/nodegroup"] // "") as $ng | $ngs | index($ng))
+         | select(.spec.unschedulable != true)
+         | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length' || echo 0)
+    [ "$ready" -ge "$want" ] && break
+    [ $SECONDS -lt $deadline ] || die "$ready of $want nodes Ready after ${TIMEOUT}s. Run unpark again to finish."
+    log "  nodes Ready: $ready of $want"
+    sleep 15
+  done
+  log "nodes Ready: $ready of $want"
+
+  unpark_lbs "$state" || die "DNS not restored. Run unpark again once the load balancers exist."
+
+  state=$(read_state)
+  write_state "$(jq -c --arg t "$(date -u +%FT%TZ)" '.parked = false | .unparkedAt = $t | .loadBalancers = []' <<<"$state")"
+  log "UNPARKED: $CLUSTER"
+  check_pods
+}
+
+# ---------------------------------------------------------------------------
+# Pods after unpark
+#
+# A cold start is noisy: pods sit Pending while nodes join, pull images, and
+# crash once or twice while what they depend on comes up. None of that is a
+# failure, and an unpark that exits 1 on it teaches people to ignore the exit
+# code. So unpark waits for the noise to settle, then fails only on pods that
+# cannot start however long they wait:
+#   - an image that does not exist (InvalidImageName, or a pull refused as
+#     not found), which is what check_images guards against at park;
+#   - a volume pinned to a zone that no node is in. The scheduler reports
+#     "volume node affinity conflict", and the pod stays Pending until a node
+#     comes up in that zone. See fizz/eks-pv-az.
+# Everything else still starting at the deadline is listed as a warning.
+# ---------------------------------------------------------------------------
+
+POD_SETTLE="${POD_SETTLE_ARG:-300}"
+
+pods_json() { kc get pods -A -o json 2>/dev/null || echo '{"items":[]}'; }
+
+# ns/name<TAB>reason lines for pods that will not start on their own.
+stuck_pods() {   # stdin = pods JSON
+  jq -r '
+    def gone: test("not found|manifest unknown|name unknown|repository does not exist|does not exist or no pull access"; "i");
+    .items[]
+    | "\(.metadata.namespace)/\(.metadata.name)" as $p
+    | ( ([.status.containerStatuses[]?, .status.initContainerStatuses[]?]
+         | map(.state.waiting // empty)
+         | map(select(.reason == "InvalidImageName"
+                      or ((.reason == "ErrImagePull" or .reason == "ImagePullBackOff") and ((.message // "") | gone))))
+         | first | select(.) | "image: \(.message // .reason)"),
+        ([.status.conditions[]?
+          | select(.type == "PodScheduled" and .status == "False"
+                   and ((.message // "") | test("volume node affinity conflict")))]
+         | first | select(.) | "volume in a zone with no node: \(.message)")
+      )
+    | "\($p)\t\(.)"' | sort -u
+}
+
+# ns/name<TAB>state lines for pods still on their way up.
+starting_pods() {   # stdin = pods JSON
+  jq -r '
+    .items[]
+    | select(.status.phase == "Pending"
+             or ([.status.containerStatuses[]? | .state.waiting.reason // empty] | length > 0))
+    | .status.phase as $phase
+    | "\(.metadata.namespace)/\(.metadata.name)\t\(
+        [.status.containerStatuses[]? | .state.waiting.reason // empty] | first // $phase)"'
+}
+
+check_pods() {
+  local deadline=$((SECONDS + POD_SETTLE)) pods stuck starting
+  while :; do
+    pods=$(pods_json)
+    stuck=$(stuck_pods <<<"$pods")
+    # A stuck pod is also not running. Waiting longer changes nothing for it.
+    starting=$(starting_pods <<<"$pods" \
+      | awk -F'\t' 'NR == FNR { s[$1]; next } !($1 in s)' <(cut -f1 <<<"$stuck") -)
+    [ -z "$starting" ] && break
+    [ $SECONDS -lt $deadline ] || break
+    log "  pods still starting: $(sed '/^$/d' <<<"$starting" | wc -l | tr -d ' ')"
+    sleep 15
+  done
+  if [ -n "$starting" ]; then
+    warn "$(sed '/^$/d' <<<"$starting" | wc -l | tr -d ' ') pod(s) still starting after ${POD_SETTLE}s:"
+    sed 's/^/    /' <<<"$starting" >&2
+  fi
+  if [ -n "$stuck" ]; then
+    echo "$(date -u '+%H:%M:%SZ') | ERROR: $(wc -l <<<"$stuck" | tr -d ' ') pod(s) cannot start:" >&2
+    sed 's/^/    /' <<<"$stuck" >&2
+    exit 1
+  fi
+  log "pods: none that cannot start"
+}
+
+# The controller rebuilds each deleted load balancer from its Ingress or Service
+# under the same name, with a new DNS name. Records still on a parked page move
+# to it. ExternalDNS also moves the records it owns, so some may already be done.
+unpark_lbs() {   # $1 = state
+  local n lb name rec cur failed=0 deadline d dns zone
+  n=$(jq '.loadBalancers | length' <<<"$1")
+  [ "$n" != 0 ] || return 0
+  while read -r lb; do
+    name=$(jq -r .name <<<"$lb")
+    deadline=$((SECONDS + TIMEOUT)); d=""
+    while :; do
+      d=$(awsr elbv2 describe-load-balancers --names "$name" \
+            --query "LoadBalancers[?State.Code=='active']|[0].[DNSName,CanonicalHostedZoneId]" \
+            --output text 2>/dev/null || true)
+      [ -n "$d" ] && [ "$d" != None ] && break
+      [ $SECONDS -lt $deadline ] || break
+      log "  waiting for load balancer $name"
+      sleep 15
+    done
+    if [ -z "$d" ] || [ "$d" = None ]; then
+      warn "load balancer $name not active after ${TIMEOUT}s"
+      failed=$((failed + 1)); continue
+    fi
+    read -r dns zone <<<"$d"
+    log "load balancer $name is back as $dns"
+    while read -r rec; do
+      cur=$(awsr route53 list-resource-record-sets --hosted-zone-id "$(jq -r .zoneId <<<"$rec")" \
+              --start-record-name "$(jq -r .name <<<"$rec")" --start-record-type "$(jq -r .type <<<"$rec")" \
+              --max-items 1 --output json \
+            | N="$(jq -r .name <<<"$rec")" jq -r '
+                .ResourceRecordSets[0] // {}
+                | select((.Name // "" | gsub("\\\\052"; "*") | rtrimstr(".")) == (env.N | rtrimstr(".")))
+                | (.AliasTarget.DNSName // (.ResourceRecords // [])[0].Value // "") | ascii_downcase')
+      if [[ "$cur" == *"${dns,,}"* ]]; then
+        log "  $(jq -r .name <<<"$rec") already on $dns"
+        continue
+      fi
+      point_record "$rec" "$dns" "$zone" true || failed=$((failed + 1))
+    done < <(jq -c '.records[]' <<<"$lb")
+  done < <(jq -c '.loadBalancers[]' <<<"$1")
+  [ "$failed" = 0 ]
+}
+
+case "$ACTION" in
+  status) status ;;
+  park)   park ;;
+  unpark) unpark ;;
+esac

@@ -1,0 +1,73 @@
+# Park and unpark from GitHub Actions, so anyone with write access to the repo
+# can bring the cluster back without the person who parked it.
+#
+# Dispatch only. A schedule that parks a cluster nobody is watching is a
+# decision made once and forgotten; a button is a decision made each time.
+#
+# Copy to .github/workflows/park.yml, then set:
+#   - the role ARN: an IAM role with the policy from terraform/iam-policy, trusting
+#     this repo's OIDC subject (pin it to refs/heads/main);
+#   - an EKS access entry for that role, bound to the ClusterRole in
+#     examples/rbac.yaml;
+#   - CLUSTER and AWS_REGION below.
+
+name: Park EKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: park, unpark or status
+        type: choice
+        options: [status, park, unpark]
+        default: status
+      only:
+        description: park only these nodegroups (comma list, empty for all)
+        type: string
+        default: ""
+      dry_run:
+        description: print what would change, change nothing
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+
+# A park and an unpark racing each other leave the record and the cluster
+# disagreeing. One at a time per cluster, and never cancel one in flight.
+concurrency:
+  group: eks-park-${{ vars.CLUSTER || 'my-cluster' }}
+  cancel-in-progress: false
+
+env:
+  CLUSTER: ${{ vars.CLUSTER || 'my-cluster' }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  park:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.PARK_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: kubeconfig
+        run: aws eks update-kubeconfig --name "$CLUSTER" --region "$AWS_REGION" --alias "$CLUSTER"
+
+      - name: eks-park
+        env:
+          ACTION: ${{ inputs.action }}
+          ONLY: ${{ inputs.only }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=("$ACTION" "$CLUSTER" --region "$AWS_REGION")
+          # unpark reads everything from the record. Passing park options to it
+          # would only invite a mismatch.
+          if [ "$ACTION" = park ] && [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
+          if [ "$ACTION" != status ] && [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
+          ./eks-park "${args[@]}"
