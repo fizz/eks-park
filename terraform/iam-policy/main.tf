@@ -64,7 +64,6 @@ data "aws_iam_policy_document" "this" {
       "eks:ListNodegroups",
       "eks:DescribeNodegroup",
       "autoscaling:DescribeAutoScalingGroups",
-      "autoscaling:DescribeTags",
       "tag:GetResources",
       "elasticloadbalancing:DescribeLoadBalancers",
       "elasticloadbalancing:DescribeTargetGroups",

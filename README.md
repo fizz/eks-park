@@ -19,6 +19,7 @@ eks-park park   my-cluster --region us-east-1 --dry-run
 eks-park park   my-cluster --region us-east-1 --delete-lbs
 eks-park park   my-cluster --region us-east-1 --only batch,gpu
 eks-park unpark my-cluster --region us-east-1
+eks-park check  my-cluster --region us-east-1
 ```
 
 | Option | Effect |
@@ -35,6 +36,7 @@ eks-park unpark my-cluster --region us-east-1
 | `--skip-image-check` | Do not check that images can still be pulled. |
 | `--timeout S` | How long to wait for instances, nodes and load balancers. Default 600. |
 | `--pod-settle S` | How long pods get to start after unpark before the check. Default 300. |
+| `--no-check` | Unpark without the pod check. Run `eks-park check` once your other steps finish. |
 | `--dry-run` | Print every change and make none. |
 
 Unpark reads everything from the record. You do not repeat the park options.
@@ -49,6 +51,8 @@ So unpark waits up to `--pod-settle` seconds, then exits 1 only for pods that wi
 - **A volume in a zone with no node.** The scheduler reports `volume node affinity conflict`, and the pod stays Pending until a node comes up in that zone. [eks-pv-az](https://github.com/fizz/eks-pv-az) finds and fixes these.
 
 Pods still starting at the deadline are listed as a warning, and the exit code stays 0.
+
+When something should run between unpark and the check, for example a step that moves stranded volumes, use `unpark --no-check` and then `check`. Do not let the check fail on pods that the next step is about to fix: a failed step skips the steps after it.
 
 ## Running it from GitHub Actions
 

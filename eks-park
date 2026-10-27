@@ -4,6 +4,7 @@
 #   eks-park status <cluster> [options]
 #   eks-park park   <cluster> [options]
 #   eks-park unpark <cluster> [options]
+#   eks-park check  <cluster> [options]
 #
 # Park records what it changes in one SSM parameter, so unpark takes no sizes
 # and the person who unparks does not need to be the person who parked.
@@ -30,11 +31,11 @@ if [ "${BASH_VERSINFO[0]}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" = 4 ] && [ "${BA
   echo "eks-park needs bash 4.4 or later (this is $BASH_VERSION)" >&2; exit 2
 fi
 
-VERSION=1.0.0
+VERSION=1.1.0
 
 usage() {
   cat <<'EOF'
-usage: eks-park <status|park|unpark> <cluster> [options]
+usage: eks-park <status|park|unpark|check> <cluster> [options]
 
   --region R              AWS region (default: $AWS_REGION)
   --context C             kubectl context (default: the cluster name)
@@ -51,8 +52,10 @@ usage: eks-park <status|park|unpark> <cluster> [options]
   --skip-image-check      park: do not check that images can still be pulled
   --timeout SECONDS       how long to wait for instances, nodes and load
                           balancers (default: 600)
-  --pod-settle SECONDS    unpark: how long pods get to start before the check
-                          (default: 300)
+  --pod-settle SECONDS    unpark, check: how long pods get to start before the
+                          check (default: 300)
+  --no-check              unpark: skip the pod check, to run it later as
+                          "check" after other steps (a volume move, say)
   --dry-run               print what would change, change nothing
 EOF
 }
@@ -63,7 +66,7 @@ EOF
 
 ACTION="${1:-}"; CLUSTER="${2:-}"
 case "$ACTION" in
-  status|park|unpark) ;;
+  status|park|unpark|check) ;;
   -h|--help|help) usage; exit 0 ;;
   --version) echo "eks-park $VERSION"; exit 0 ;;
   *) usage >&2; exit 2 ;;
@@ -73,7 +76,7 @@ shift 2
 
 REGION="${AWS_REGION:-}"; CONTEXT=""; STATE_PARAM=""
 ONLY=""; EXCEPT=""; DELETE_LBS=0; PARKED_PAGE=""; ZONES=(); ALLOW_DANGLING=0
-CHECK_IMAGES=1; TIMEOUT=600; DRY=0; POD_SETTLE_ARG=""
+CHECK_IMAGES=1; TIMEOUT=600; DRY=0; POD_SETTLE_ARG=""; NO_CHECK=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -90,6 +93,7 @@ while [ $# -gt 0 ]; do
     --timeout)          TIMEOUT="${2:?--timeout needs seconds}"; shift 2 ;;
     --pod-settle)       POD_SETTLE_ARG="${2:?--pod-settle needs seconds}"; shift 2 ;;
     --dry-run)          DRY=1; shift ;;
+    --no-check)         NO_CHECK=1; shift ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
@@ -188,10 +192,15 @@ asg_instances() {   # ASG names as arguments -> instance ids
     | tr '\t' '\n' | sed '/^$/d'
 }
 
+# Read from DescribeAutoScalingGroups, which the record already needs, so the
+# role needs no autoscaling:DescribeTags. A denied call must stop the park, not
+# read as "no tag": the autoscaler would bring the parked nodegroup back.
 asg_has_ca_tag() {   # $1 = ASG
-  [ "$(awsr autoscaling describe-tags \
-        --filters "Name=auto-scaling-group,Values=$1" "Name=key,Values=$CA_TAG" \
-        --query 'length(Tags)' --output text)" != 0 ]
+  local n
+  n=$(awsr autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$1" \
+        --query "length(AutoScalingGroups[0].Tags[?Key=='$CA_TAG'])" --output text) \
+    || die "cannot read the tags of $1"
+  [ "$n" != 0 ]
 }
 
 # ---------------------------------------------------------------------------
@@ -688,6 +697,10 @@ unpark() {
   state=$(read_state)
   write_state "$(jq -c --arg t "$(date -u +%FT%TZ)" '.parked = false | .unparkedAt = $t | .loadBalancers = []' <<<"$state")"
   log "UNPARKED: $CLUSTER"
+  if [ "$NO_CHECK" = 1 ]; then
+    log "pod check skipped (--no-check); run \"eks-park check\" when ready"
+    return 0
+  fi
   check_pods
 }
 
@@ -813,4 +826,5 @@ case "$ACTION" in
   status) status ;;
   park)   park ;;
   unpark) unpark ;;
+  check)  check_pods ;;
 esac
