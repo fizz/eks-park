@@ -31,7 +31,7 @@ if [ "${BASH_VERSINFO[0]}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" = 4 ] && [ "${BA
   echo "eks-park needs bash 4.4 or later (this is $BASH_VERSION)" >&2; exit 2
 fi
 
-VERSION=1.1.0
+VERSION=1.1.1
 
 usage() {
   cat <<'EOF'
@@ -159,13 +159,15 @@ all_nodegroups() {
     --query 'nodegroups[]' --output text | tr '\t' '\n' | sed '/^$/d'
 }
 
+# Callers run this in $(...) under set -e, so it must return 0 even when the
+# last nodegroup is not selected. A trailing "[[ ]] && echo" would not.
 selected_nodegroups() {
   local ng
   for ng in $(all_nodegroups); do
     if [ -n "$ONLY" ]; then
-      [[ ",$ONLY," == *",$ng,"* ]] && echo "$ng"
+      if [[ ",$ONLY," == *",$ng,"* ]]; then echo "$ng"; fi
     elif [ -n "$EXCEPT" ]; then
-      [[ ",$EXCEPT," == *",$ng,"* ]] || echo "$ng"
+      if [[ ",$EXCEPT," != *",$ng,"* ]]; then echo "$ng"; fi
     else
       echo "$ng"
     fi
